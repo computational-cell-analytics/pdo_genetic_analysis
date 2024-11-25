@@ -1,0 +1,1 @@
+Here I've written two scripts to analyse Pacreatic and Rectal cancer genetic data, respectively. rectal cancer analysis script is more smooth since all redundant parts of the pancreatic script were deleted.
