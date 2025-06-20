@@ -2,6 +2,7 @@
 import torch
 from torch import nn
 from torchvision.transforms.v2 import GaussianNoise
+import torch.nn.functional as F
 std = 0.03
 # class GaussianNoise(nn.Module):
 #     """Gaussian noise regularizer.
@@ -115,7 +116,7 @@ class Encoder(nn.Module):
         # print('input', x.shape)
         x = self.input(x)
         # print('after in[', x.shape)
-        x = nn.ReLU()(x)
+        # x = nn.ReLU()(x) ##commented
         x = self.block1(x)
         # print('b1', x.shape)
         x = self.block2(x)
@@ -150,7 +151,7 @@ class Decoder(nn.Module):
         self.block2 = resblock_up_sample(1024, 1024, std)
         self.block3 = resblock_up_sample(1024, 512, std)
         self.block4 = resblock_up_sample(512, 512, std)
-        self.to_img = nn.Sequential(nn.Conv2d(512, 3, 3, 1, 'same'), nn.Tanh())
+        self.to_img = nn.Sequential(nn.Conv2d(512, 3, 3, 1, 'same'), nn.Sigmoid())
     def forward(self, x):
         x =  self.input(x)
         # print(x.shape)
@@ -184,10 +185,11 @@ class Discriminator(nn.Module):
             nn.utils.spectral_norm(nn.Linear(1024, 2048)),
             #nn.BatchNorm1d(2048),
             nn.LeakyReLU(0.2),
+            # nn.utils.spectral_norm(nn.Linear(2048, 2048)),
+            # nn.BatchNorm1d(2048),
+            # nn.LeakyReLU(0.2),
             nn.utils.spectral_norm(nn.Linear(2048, 2048)),
-            nn.BatchNorm1d(2048),
-            nn.LeakyReLU(0.2),
-            nn.utils.spectral_norm(nn.Linear(2048, 2048)),
+            nn.Dropout(0.35), ##just added
             #nn.BatchNorm1d(2048),
             nn.LeakyReLU(0.2),
             nn.utils.spectral_norm(nn.Linear(2048, 1024)),
@@ -221,4 +223,58 @@ class Discriminator(nn.Module):
 class Recognizer(nn.Module):
     def __init__(self, ):
         super().__init__()
-        
+
+
+class VGG(nn.Module):
+    def __init__(self, model):
+        super(VGG, self).__init__()
+        self.model = model
+        self.clf = nn.ModuleList([nn.ReLU(), nn.Linear(512, 128),
+                                  nn.ReLU(), nn.Linear(128, 32),
+                                  nn.ReLU(), nn.Linear(32, 1)])
+        #self.sig = 
+        self.clf1 = nn.ModuleList([nn.ReLU(), nn.Linear(16, 1)])
+
+    def forward(self, x):
+        x = self.model(x)
+        x = self.clf1[0](x)
+        x = self.clf1[1](x)
+        # for i in self.clf:
+        #     x = i(x)
+        # x = torch.nn.Sigmoid(x)
+        return x
+
+
+class Disentangler(nn.Module):
+    def __init__(self, in_channels=3, num_classes=350):
+        super().__init__()
+        self.initial = nn.utils.spectral_norm(nn.Conv2d(in_channels, 64, kernel_size=3, stride=1, padding=1))
+        self.res1 = resblock_down_sample(64, 512, std)
+        self.res2 = resblock_down_sample(512, 1024, std)
+        self.res3 = resblock_down_sample(1024, 1024, std)
+        self.res4 = resblock_down_sample(1024, 1024, std)
+        self.flatten = nn.Flatten()
+        self.swish = nn.SiLU()
+        self.fc = nn.Linear(1024 * 4 * 4, num_classes)
+
+    def forward(self, x):
+        x = self.initial(x)  # (64,64,64)
+        # x = F.Relu(x) ###Commented
+        x = self.res1(x)             # (512,32,32)
+        x = self.res2(x)             # (512,16,16)
+        x = self.res3(x)             # (1024,8,8)
+        x = self.res4(x)             # (1024,4,4)
+        x = self.flatten(x)          # (16,384)
+        x = self.swish(x)
+        x = self.fc(x)               # (350,)
+        return x #F.softmax(x, dim=1)
+
+class simple_neuron(nn.Module):
+    def __init__(self, sub_features = 14):
+        super().__init__()
+        self.sub_features = sub_features
+        self.simple_clf = nn.Linear(self.sub_features, 1)
+
+    def forward(self, x):
+        x = self.simple_clf(x[:, :self.sub_features])  # (64,64,64)
+        return x
