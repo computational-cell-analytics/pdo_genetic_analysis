@@ -9,6 +9,7 @@ import random
 from torch.utils.data import DataLoader
 import pandas as pd
 
+
 class CellImageEncoder(nn.Module):
     def __init__(self, embedding_dim=128):
         super(CellImageEncoder, self).__init__()
@@ -136,3 +137,67 @@ def compute_class_separability(embeddings, labels, max_pairs=2000):
         'inter_class_dist': inter_mean,
         'separability_score': score
     }
+# model = CellImageEncoder()
+# model = torch.load("/user/sina.garazhian/u12203/lustere-grete-mine/representaion_learning/represent_model_epoch10.pt", weights_only=False)
+# device = 'cuda'
+# pdo_metadata = pd.read_csv("/user/sina.garazhian/u12203/panc_cell/pdo_data_drug_info_rectal_d5_s3_chr_sx5_ts_combined_v3_corrected.csv", dtype=object)
+# patients = set(pdo_metadata['patient_name'].values)
+# patient_dict = {patient: idx for idx, patient in enumerate(patients)}
+
+# device = 'cuda'
+# control_val = torch.load( "/user/sina.garazhian/u12203/lustere-grete-mine/patient_classifier/Control_40_cleaned_val.pt", weights_only=False)
+
+
+# labels = [label for _,_,_, label in control_val]  # your dataset labels
+
+# val_loader = DataLoader(control_val, batch_size=64)
+
+
+# all_embeddings, all_labels = [], []
+# model.eval()
+# val_loss = 0.0
+# with torch.no_grad():
+#     for images, _, _, labels in val_loader:
+#         images = images.to(device)
+#         labels = torch.tensor([patient_dict[pat] for pat in labels], device=device)
+#         embeddings = model(images)
+#         # prototypes = Train.compute_prototypes(torch.cat(all_embeddings), torch.cat(all_labels))
+#         # loss = Train.prototype_contrastive_loss(embeddings, labels, prototypes)
+#         # val_loss += loss.item()
+#         emb = model(images)
+#         all_embeddings.append(emb)
+#         all_labels.append(labels)
+#     all_embeddings = torch.cat(all_embeddings, dim=0)
+#     all_labels = torch.cat(all_labels, dim=0)
+#     sep_stats = compute_class_separability(all_embeddings, all_labels)
+from torchvision.models import resnet50, ResNet50_Weights, resnet18
+
+class resnet_enocer(nn.Module):
+    def __init__(self):
+        super(resnet_enocer, self).__init__()
+        self.model = resnet50(ResNet50_Weights.IMAGENET1K_V2)
+        self.model.conv1 = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+        self.encoder = nn.Sequential(*[layer for layer in self.model.children()][:-1])
+        self.proj = nn.Linear(2048, 1024)
+        # self.avgpool = nn.AdaptiveAvgPool2d()
+    def forward(self, x):
+        x = self.encoder(x).squeeze(-1).squeeze(-1)
+        x = self.proj(x)
+        # x = self.avgpool(x)
+        return x        
+    
+class resnet_encoder_18(nn.Module):
+    def __init__(self):
+        super(resnet_encoder_18, self).__init__()
+        self.model = resnet18()
+        self.model.conv1 = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+        self.encoder = nn.Sequential(*[layer for layer in self.model.children()][:-1])
+        self.proj = nn.Linear(512, 128)
+        self.relu = nn.ReLU()
+        # self.avgpool = nn.AdaptiveAvgPool2d()
+    def forward(self, x):
+        x = self.encoder(x).squeeze(-1).squeeze(-1)
+        x = self.proj(x)
+        x = self.relu(x)
+        return x     
+    
