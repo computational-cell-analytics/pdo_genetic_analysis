@@ -1,0 +1,596 @@
+import pandas as pd
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+from torchvision import datasets
+from torchvision.transforms import ToTensor, Grayscale
+import matplotlib.pyplot as plt
+from torchvision.io import read_image
+from torchvision.transforms import v2, Resize
+from torchvision.transforms.functional import resize
+import cv2
+from glob import glob
+import utils as models
+import torch.optim as optim
+import losses
+from torchvision.models import vgg19, VGG19_Weights
+from matplotlib import pyplot as plt
+from utils import VGG
+from losses import *
+import torch.nn.functional as F
+import os
+import visulize
+
+
+def validate_model(
+    encod, decod, disc, recog, clf_model, subset_model,
+    perception_loss_clf_func, clf_loss_func, subset_loss_func, losses,
+    valid_loader, latent_dim, std_range, var_weight, gen_weight,
+    epoch, device
+):
+    encod.eval()
+    decod.eval()
+    disc.eval()
+    recog.eval()
+    subset_model.eval()
+    clf_model.eval()
+
+    val_recon = 0
+    val_disc = 0
+    val_gen = 0
+    val_clf = 0
+    val_disent = 0
+    val_cov = 0
+    val_vae_all = 0
+    val_subset = 0
+
+    z_std = compute_latent_feature_variance(encod, valid_loader, device)
+
+    with torch.no_grad():
+        for imgs, labels in valid_loader:
+            imgs = imgs.to(device)
+            altered_index = torch.randint(0, latent_dim, (1,)).item()
+
+            z_img = encod(imgs)
+            img_recon = decod(z_img)
+
+            range_alteration = (torch.rand(latent_dim) * 2 * std_range) - std_range
+            range_alteration = range_alteration.to(device)
+            z_alter = z_img.clone()
+            z_alter[:, altered_index] = z_alter[:, altered_index] + z_std[altered_index] * range_alteration[altered_index]
+            alt_img_recon = decod(z_alter)
+            diff_img = (img_recon - alt_img_recon).abs().to(device)
+
+            logits = recog(diff_img)
+            altered_labels = torch.full((imgs.size(0),), altered_index, dtype=torch.long, device=device)
+            disent_loss = F.cross_entropy(logits, altered_labels)
+
+            recon_loss = perception_loss_clf_func(img_recon, imgs)
+            clf_loss = clf_loss_func(img_recon, imgs)
+            z_var_loss = losses.latent_z_variance_loss(z_img)
+            clf_target = torch.sigmoid(clf_model(imgs))
+            subset_loss = subset_loss_func(subset_model(z_img), clf_target)
+
+            total_vae_loss = 5 * recon_loss + 5 * clf_loss + 0.0001 * z_var_loss + subset_loss + disent_loss
+
+            normal_dist = torch.randn((imgs.size(0), z_img.shape[1])).to(device)
+            disc_loss = losses.Discriminator_loss(disc(normal_dist), disc(z_img))
+            gen_loss = gen_weight * (-torch.mean(torch.log(disc(z_img))))
+
+            val_clf += clf_loss.item()
+            val_recon += recon_loss.item()
+            val_cov += var_weight * z_var_loss.item()
+            val_disent += disent_loss.item()
+            val_vae_all += total_vae_loss.item()
+            val_subset += subset_loss.item()
+            val_disc += disc_loss.item()
+            val_gen += gen_loss.item()
+        plt.figure()
+        f, axarr = plt.subplots(2,5)
+        plt.title("Reconstruction Progress report")
+        for idx, i in enumerate(img_recon):
+            axarr[0,idx].imshow(imgs.cpu().detach().numpy()[idx][0], cmap='gray')
+            axarr[1,idx].imshow(i.cpu().detach().numpy()[0], cmap='gray')
+       
+            plt.savefig(f"/user/sina.garazhian/u12203/lustere-grete-mine/DISCOWER/{epoch}.png")
+            plt.show()
+        
+            if idx == 4:
+                break
+        plt.close()
+
+    return {
+        'recon': val_recon / len(valid_loader),
+        'disc': val_disc / len(valid_loader),
+        'gen': val_gen / len(valid_loader),
+        'clf': val_clf / len(valid_loader),
+        'disent': val_disent / len(valid_loader),
+        'cov': val_cov / len(valid_loader),
+        'vae_all': val_vae_all / len(valid_loader),
+        'subset': val_subset / len(valid_loader)
+    }
+
+###getting data
+# train_paths = glob("/kaggle/input/alzheimers-dataset-4-class-of-images/Alzheimer_s Dataset/train/**/*.jpg", recursive = True)
+train_no_paths = glob("/user/sina.garazhian/u12203/kaggle_alz/train/NonDemented/*.jpg")
+train_very_paths = glob("/user/sina.garazhian/u12203/kaggle_alz/train/VeryMildDemented/*.jpg")
+train_paths = np.array(train_no_paths + train_very_paths)
+test_no_paths = glob("/user/sina.garazhian/u12203/kaggle_alz/test/NonDemented/*.jpg")
+test_very_paths = glob("/user/sina.garazhian/u12203/kaggle_alz/test/VeryMildDemented/*.jpg")
+test_paths = np.array(test_no_paths + test_very_paths)
+print('number of train paths', len(train_paths))
+train_labels = np.array(['Non' not in path.split('/')[-2] for path in train_paths]) * 1
+test_labels = np.array(['Non' not in path.split('/')[-2] for path in test_paths]) * 1
+
+
+idx = np.arange(train_paths.shape[0])
+np.random.shuffle(idx)
+train_paths = train_paths[idx]
+train_labels = train_labels[idx]
+idx = np.arange(test_paths.shape[0])
+np.random.shuffle(idx)
+test_paths = test_paths[idx]
+test_labels = test_labels[idx]
+
+###create dataset torch object
+
+
+class cv_2_transforms(torch.nn.Module):
+    def __init__(self, img_size, margin = 20):
+        super(cv_2_transforms, self).__init__()
+        self.img_size = img_size
+        self.margin = margin
+    def forward(self, img):
+        #img = img.numpy()
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        img = img[self.margin:img.shape[0]-self.margin , self.margin:img.shape[1]-self.margin]
+        img = cv2.resize(img, (self.img_size,self.img_size) , interpolation = cv2.INTER_AREA)
+        return img
+
+normalise_resize = v2.Compose([
+    v2.ToDtype(torch.float32, scale=True),
+    cv_2_transforms(64),
+    #ToTensor(),
+    # v2.Normalize(mean=means, std=stds),
+                #Grayscale(num_output_channels = 3),
+    ToTensor()
+])
+
+
+class custom_dataset(Dataset):
+    def __init__(self, img_paths, img_labels, transform = None):
+        self.img_paths = img_paths
+        self.img_labels = img_labels
+        self.transform = transform
+    def __getitem__(self,index):
+        img = read_image(self.img_paths[index])
+        img = cv2.imread(self.img_paths[index])
+        label = self.img_labels[index]
+        if self.transform:
+            img = self.transform(img)
+        #img = torch.permute(img, (2, 0, 1))
+        img = img.repeat(3, 1, 1)
+        # img = img/255
+        # img = (img - means)/stds
+        return img, label
+    def __len__(self):
+        return(len(self.img_paths))
+    
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+###Create dataset and dataloader instances
+train_img_normal_dataset = custom_dataset(train_paths, train_labels, normalise_resize)
+test_img_normal_dataset = custom_dataset(test_paths, test_labels, normalise_resize)
+val_img_normal_dataset, test_img_normal_dataset = torch.utils.data.random_split(test_img_normal_dataset, [0.5, 0.5])
+batch_size = 128
+train_loader = DataLoader(train_img_normal_dataset, batch_size = batch_size, shuffle = True)
+val_loader = DataLoader(val_img_normal_dataset, batch_size = batch_size, shuffle = True)
+test_loader = DataLoader(test_img_normal_dataset, batch_size = batch_size, shuffle = True)
+
+###Cretae models
+latent_size = 150
+encod = models.Encoder(3, 0.03, latent_size)
+decod = models.Decoder(latent_size, 0.03)
+disc = models.Discriminator(latent_size)
+recog = models.Recognizer(latent_size)
+imgnet_model = vgg19(VGG19_Weights.IMAGENET1K_V1)
+subset_model = models.simple_neuron()
+recog_attend = models.CrossAttentionRecognizer()
+clf_model = torch.load("/user/sina.garazhian/u12203/DISCOWER/best_vgg.pt", weights_only = False, map_location=device).eval()
+
+encod.to(device)
+decod.to(device)
+disc.to(device)
+imgnet_model.to(device)
+recog.to(device)
+subset_model.to(device)
+recog_attend.to(device)
+ 
+lr = 0.0001 
+weight_decay = 1e-4
+opt_vae = optim.AdamW(list(encod.parameters()) + list(decod.parameters()), lr=lr)
+opt_disc = optim.AdamW(disc.parameters(), lr=lr/5, weight_decay = weight_decay)
+opt_gen = optim.AdamW(encod.parameters(), lr=lr/5)
+opt_recog = optim.AdamW(recog.parameters(), lr = lr )
+opt_subset = optim.AdamW(subset_model.parameters(), lr = lr/5)
+opt_recog_attend = optim.AdamW(recog_attend.parameters(), lr=1e-4, weight_decay=1e-4)
+
+from torch.optim.lr_scheduler import OneCycleLR
+
+# Assuming you know total number of steps:
+# total_steps = num_epochs * len(dataloader)
+
+# === Hyperparameters ===
+epochs = 100
+batch_size = 128
+latent_dim = 150
+lr_vae = 1e-4
+lr_disc = 2e-5
+lr_gen = 2e-5
+adv_weight = 0.05
+var_weight = 0.0001
+alpha = 0.5  # for hybrid loss
+warmup_epochs = 5
+std_range = 3
+
+
+scheduler_vae = OneCycleLR(
+    opt_vae,
+    max_lr=1e-4,            # peak learning rate
+    steps_per_epoch=len(train_loader),
+    epochs=epochs,
+    pct_start=0.2,          # % of cycle spent increasing LR
+    anneal_strategy='cos',  # or 'linear'
+    div_factor=25.0,        # initial LR = max_lr / div_factor
+    final_div_factor=1e4    # min LR = initial LR / final_div_factor
+)
+
+
+
+
+def compute_latent_feature_variance(encoder, dataloader, device):
+    encoder.eval()  # Set encoder to evaluation mode
+    all_latents = []
+
+    with torch.no_grad():
+        for imgs, _ in dataloader:
+            imgs = imgs.to(device)
+            z = encoder(imgs)  # shape: [batch_size, latent_dim]
+            all_latents.append(z.cpu())  # move to CPU to avoid GPU memory issues
+
+    # Concatenate all latent vectors: shape [N_samples, latent_dim]
+    all_latents = torch.cat(all_latents, dim=0)
+
+    # Compute variance per feature (dim=0 is across samples)
+    feature_variances = torch.std(all_latents, dim=0, unbiased=True)  # shape: [latent_dim]
+    feature_means = torch.mean(all_latents, dim=0)
+
+    return feature_variances, feature_means
+
+recon_losses = []
+disc_losses = []
+gen_losses = []
+clf_losses = []
+disent_losses = []
+all_vae_losses = []
+mean_losses = []
+cov_losses = []
+subset_losses = []
+recon_losses_test = []
+disc_losses_test = []
+gen_losses_test = []
+clf_losses_test = []
+all_vae_losses_test = []
+disent_losses_test = []
+mean_losses_test = []
+cov_losses_test = []
+subset_losses_test = []
+
+
+os.system('rm ~/lustere-grete-mine/DISCOWER/diff_imgs/*')
+os.system('rm /user/sina.garazhian/u12203/lustere-grete-mine/DISCOWER/*.png')
+perception_loss_clf_func = losses.PerceptionLossVGG(device)
+pixel_loss = losses.PixelwiseLoss(mode='l1')
+clf_loss_func = losses.clf_orientedLoss("/user/sina.garazhian/u12203/DISCOWER/best_vgg.pt", device)
+subset_loss_func = nn.BCEWithLogitsLoss()
+focal_loss = losses.FocalLoss()
+
+for epoch in range(epochs):
+    z_std, z_mean = compute_latent_feature_variance(encod, train_loader, device)
+    print(f"Epoch {epoch - 1} - latent mean avg: {z_mean.mean():.3f}, std avg: {z_std.mean():.3f}, {(z_std >= 0.1).sum()} latent features have std higher than 0.1")
+    # altered_index = torch.randint(0, latent_dim, (1,)).item()
+    torch.cuda.empty_cache()
+
+    running_recon = 0
+    running_disc = 0
+    running_gen = 0
+    running_clf = 0
+    running_disent = 0
+    running_cov = 0
+    running_vae_all = 0
+    running_subset = 0
+    encod.eval()
+    z_std = compute_latent_feature_variance(encod, train_loader, device)
+    current_lr = scheduler_vae.get_last_lr()[0]
+    print(f"Current LR: {current_lr}")
+    for imgs, labels in train_loader:
+        
+        # altered_index = torch.randint(0, latent_dim, (1,)).item()
+        altered_indices = torch.randint(0, latent_dim, (imgs.size(0),), device=device) ##change different latent feature per each image
+        imgs = imgs.to(device)
+        ###Encoder + Decoder
+        disc.eval()
+        encod.train()
+        decod.train()
+        recog.train()
+        subset_model.train()
+        z_img = encod(imgs)
+        noise = torch.randn_like(z_img) * 0.01
+        z_img += noise
+        img_recon = decod(z_img)
+        # z_std = torch.std(z_img, dim = 0).to(device)
+        # std_range = std_range.to(device)
+        range_alteration = (torch.rand(latent_dim) * 2 * std_range) - std_range
+        range_alteration = range_alteration.to(device)
+        z_alter = z_img.clone()
+        #ange_corrected = torch.from_numpy(np.random.choice([-3, 3], 1)).to(device)
+        # z_alter[:, altered_index] = z_alter[:, altered_index] + z_std[altered_index] * range_alteration[altered_index] #range_corrected # * range_alteration[altered_index]
+        for i in range(imgs.size(0)): ##change different latent feature per each image
+            epsilon = torch.empty(1).uniform_(-std_range, std_range).item()
+            z_alter[i, altered_indices[i]] += epsilon ##change different latent feature per each image
+        alt_img_recon = decod(z_alter)
+        diff_img = (img_recon - alt_img_recon).abs()
+        # diff_img.requires_grad = True
+        diff_img.to(device)
+        diff_img = (diff_img - diff_img.mean()) / (diff_img.std() + 1e-6)
+        # print(diff_img[:, 0:1, :, :].shape)
+        # logits = recog_attend(diff_img)
+        logits = recog(diff_img[:, 0:1, :, :])
+       
+        # print("Logits stats:", logits.shape, logits.min().item(), logits.max().item())
+        # altered_label = torch.zeros(latent_dim)
+        # altered_label[altered_index] = 1
+        # # altered_labels = altered_label.repeat(imgs.shape[0], 1)
+        # altered_labels = torch.full((imgs.size(0),), altered_index, dtype=torch.long, device=device)
+        # disent_loss = F.cross_entropy(logits, altered_labels)
+        # disent_loss = F.cross_entropy(logits, altered_indices, label_smoothing=0.1) ##change different latent feature per each image
+        disent_loss = focal_loss(logits, altered_indices)
+        # with torch.no_grad():
+        #     preds = torch.argmax(F.softmax(logits, dim=1), dim=1)
+        #     print(f"Predicted indices: {preds[:5]}")
+        #     print(f"Ground truth: {altered_indices[:5]}")
+        # plt.imshow(diff_img[0][0].detach().cpu().squeeze(), cmap='hot')
+        # plt.title(f"Actual change is {altered_indices[0]}, Predicted is {torch.argmax(logits, dim = 1)[0]}")
+        # plt.savefig(f"/mnt/lustre-grete/usr/u12203/DISCOWER/diff_imgs/{epoch}_{disent_loss.item()}.png")
+        # plt.show()
+        # plt.close()
+        # selected_indices = torch.randperm(latent_dim)[:7].tolist()
+        # cf_loss = losses.counterfactual_consistency_loss(encod, decod, clf_model, imgs, 
+        #     z_std, selected_indices, epsilon=1.5, device='cuda')
+        #altered_labels = altered_labels.to(device)
+        # disent_loss = F.cross_entropy(logits, altered_labels, label_smoothing=0.05)
+        recon_loss = perception_loss_clf_func(img_recon, imgs)
+        clf_loss = clf_loss_func(img_recon, imgs)
+        #z_var_loss = losses.latent_z_variance_loss(z_img)
+        z_var_loss = losses.covariance_loss(z_img)
+        with torch.no_grad():
+            clf_target = torch.sigmoid(clf_model(imgs))  
+        subset_loss = subset_loss_func(subset_model(z_img), clf_target) #+ 0.0001 * z_var_loss
+        # opt_recog_attend.zero_grad()
+        
+        # disent_loss.backward(retain_graph=True)
+        # opt_recog_attend.step()
+        opt_recog.zero_grad()
+        
+        total_vae_loss = min(1.0, epoch/50) * recon_loss  + 3 * clf_loss + 0.5 * subset_loss + 0.5 * z_var_loss + disent_loss #+ cf_loss # disent_loss
+        opt_vae.zero_grad()
+        opt_subset.zero_grad()
+        total_vae_loss.backward()
+        torch.nn.utils.clip_grad_norm_(encod.parameters(), max_norm=5.0)
+        torch.nn.utils.clip_grad_norm_(recog.parameters(), max_norm=5.0)
+        torch.nn.utils.clip_grad_norm_(subset_model.parameters(), max_norm=5.0)
+        
+        opt_vae.step()
+        opt_recog.step()
+        scheduler_vae.step()
+        opt_subset.step()
+        
+        running_clf += clf_loss.item()
+        running_recon += recon_loss.item()
+        running_cov += z_var_loss.item()
+        running_disent += disent_loss.item()
+        running_vae_all += total_vae_loss.item()
+        running_subset += subset_loss.item()
+        # for p in recog.parameters():
+        #     if p.grad is not None:
+        #         param_norm = p.grad.data.norm(2)
+        #         total_norm += param_norm.item() ** 2
+
+        # total_norm = total_norm ** 0.5
+        # print(f"Gradient Norm: {total_norm:.6f}")
+        ###Discr
+        encod.eval()
+        decod.eval()
+        disc.train()
+        z_img= encod(imgs)
+        #disc_loss = losses.Discriminator_loss(disc, z_img, 64, 350, device)
+        normal_dist = torch.randn( (batch_size, latent_size)).to(device)
+        # disc_loss = Discrim_loss((torch.log(disc(normal_dist) + 1e-8) + torch.log(1 - disc(z_img) + 1e-8)))
+        # disc_loss = -torch.mean((torch.log(disc(normal_dist) + 1e-8) + torch.log(1 - disc(z_img) + 1e-8)))
+        def get_adv_weight(epoch):
+            if epoch < 15:
+                return 0.05  # flat warm-up
+            else:
+                return min(0.25, 1 / (1 + np.exp(-0.3 * (epoch - 15))))  # slow sigmoid
+
+        disc_weight = get_adv_weight(epoch)
+        disc_loss = disc_weight * losses.Discriminator_loss(disc(normal_dist), disc(z_img))
+        if epoch >= 10 and epoch % 2 == 0:
+            opt_disc.zero_grad()
+            disc_loss.backward()
+            torch.nn.utils.clip_grad_norm_(disc.parameters(), max_norm=5.0)
+            opt_disc.step()
+        running_disc += disc_loss.item() / disc_weight
+        ##Generatort (Advarserial)
+        encod.train()
+        decod.eval()
+        disc.eval()
+        z_img_new = encod(imgs)
+        gen_weight = 0.5
+        gen_loss = gen_weight * (-torch.mean(torch.log(disc(z_img_new))))
+        if epoch >=10:
+            opt_gen.zero_grad()
+            gen_loss.backward()
+            opt_gen.step()
+        running_gen += gen_loss.item() / gen_weight
+        ##Classification Oriented training
+    # plt.figure()
+    # f, axarr = plt.subplots(2,5)
+    # plt.title("Reconstruction Progress report")
+    # for idx, i in enumerate(img_recon):
+    #     axarr[0,idx].imshow(imgs.cpu().detach().numpy()[idx][0], cmap='gray')
+    #     axarr[1,idx].imshow(i.cpu().detach().numpy()[0], cmap='gray')
+       
+    #     plt.savefig(f"/user/sina.garazhian/u12203/lustere-grete-mine/DISCOWER/{epoch}.png")
+    #     plt.show()
+        
+    #     if idx == 4:
+    #         break
+    # plt.close()
+        # running_vae_all += ru/4
+    ###getting all losses in array
+    if epoch % 10 == 0:
+        with torch.no_grad():
+                for x_batch, _ in val_loader:  # or a fixed subset
+                    z_batch = encod(x_batch.to(device))
+                    # Just one batch per epoch
+                    visulize.plot_latent_histogram(z_batch, epoch, dims_to_plot=[0, 1, 2, 3, 4, 5, 15, 20, 30, 40, 50, 60, 100, 140], bins=50)
+    recon_losses.append(running_recon/64)
+    disc_losses.append(running_disc/64)
+    gen_losses.append(running_gen/64)
+    clf_losses.append(running_clf/64)
+    # mean_losses.append(running_mean/64)
+    cov_losses.append(running_cov/64)
+    disent_losses.append(running_disent/64)
+    all_vae_losses.append(running_vae_all/64)
+    subset_losses.append(running_subset/64)
+    print(f"Epoch {epoch}, recons loss is {recon_losses[-1]}, generator loss is {gen_losses[-1]},disent loss is {disent_losses[-1]}, clf loss is {clf_losses[-1]}, discriminator loss is {disc_losses[-1]}, cov loss is {cov_losses[-1]}, subset loss is {subset_losses[-1]}, and ALL loss is {all_vae_losses[-1]}")
+    # val_losses = validate_model(
+    # encod, decod, disc, recog, clf_model, subset_model,
+    # perception_loss_clf_func, clf_loss_func, subset_loss_func, losses,
+    # val_loader, latent_dim, std_range, var_weight, gen_weight,
+    # epoch, device
+    #     )
+    # recon_losses_test.append(val_losses['recon'])
+    # disc_losses_test.append(val_losses['disc'])
+    # gen_losses_test.append(val_losses['gen'])
+    # clf_losses_test.append(val_losses['clf'])
+    # # mean_losses.append(running_mean/64)
+    # cov_losses_test.append(val_losses['cov'])
+    # disent_losses_test.append(val_losses['disent'])
+    # all_vae_losses_test.append(val_losses['vae_all'])
+    # subset_losses_test.append(val_losses['subset'])
+    # print(f"Validation - Epoch {epoch}, recon loss: {val_losses['recon']}, discriminator loss: {val_losses['disc']}, "
+    #   f"generator loss: {val_losses['gen']}, clf loss: {val_losses['clf']}, disent loss: {val_losses['disent']}, "
+    #   f"cov loss: {val_losses['cov']}, subset loss: {val_losses['subset']}, total VAE loss: {val_losses['vae_all']}")
+
+    # running_recon = 0
+    # running_disc = 0
+    # running_gen = 0
+    # running_all = 0
+    # for imgs, labels in val_loader:
+    #     with torch.no_grad():
+    #         disc.eval()
+    #         encod.eval()
+    #         decod.eval()
+    #         imgs = imgs.to(device)
+    #         ###Encoder + Decoder
+    #         z_img= encod(imgs)
+    #         img_recon = decod(z_img)
+    #         #recon_loss = pixel_loss(img_recon, imgs)
+    #         recon_loss = perception_loss_clf_func(img_recon, imgs)
+    #         running_recon += recon_loss.item()
+    #         ###Discr
+    #         normal_dist = torch.randn( (batch_size, latent_size)).to(device)
+    #         disc_loss = -torch.mean((torch.log(disc(normal_dist) + 1e-8) + torch.log(1 - disc(z_img) + 1e-8)))
+    #         running_disc += disc_loss.item()
+    #         ##Generatort (Advarserial)
+    #         gen_loss = gen_weight * (-torch.mean(torch.log(disc(z_img))))
+    #         running_gen += gen_loss.item()
+    #         ###Classification loss
+    #         clf_loss = clf_loss_func(img_recon, imgs)
+    #         running_clf += clf_loss.item()
+    #         # running_all += running_recon + running_disc + running_gen + running_clf
+            
+ 
+
+            
+    # recon_losses_test.append(running_recon/64)
+    # disc_losses_test.append(running_disc/64)
+    # gen_losses_test.append(running_gen/64)
+    # clf_losses_test.append(running_clf/64)
+    # all_vae_losses_test.append(running_all/64)
+    # print(f"Epoch {epoch}, recons loss valid is {recon_losses_test[-1]}, discriminator loss valid is {disc_losses_test[-1]}, generator loss valid is {gen_losses_test[-1]}, and ALL loss valid is {all_losses_test[-1]}")
+
+
+plt.plot(recon_losses)
+plt.plot(disc_losses)
+plt.plot(gen_losses)
+# plt.plot(all_vae_losses)
+plt.plot(disent_losses)
+plt.plot(cov_losses)
+plt.plot(clf_losses)
+plt.plot(subset_losses)
+# plt.plot(all_losses)
+plt.title('model losses')
+plt.ylabel('loss')
+plt.xlabel('epoch')
+plt.legend(['recon', 'disc', 'gen', 'disent', 'cov', 'clf', 'subset'], loc='upper left')
+plt.savefig('/user/sina.garazhian/u12203/lustere-grete-mine/DISCOWER/models/spread_v1_train.png')
+plt.close()
+
+
+# plt.plot(recon_losses_test)
+# plt.plot(disc_losses_test)
+# plt.plot(gen_losses_test)
+# # plt.plot(all_vae_losses)
+# plt.plot(disent_losses_test)
+# plt.plot(cov_losses_test)
+# plt.plot(clf_losses_test)
+# plt.plot(subset_losses_test)
+# # plt.plot(all_losses)
+# plt.title('model validation losses')
+# plt.ylabel('loss')
+# plt.xlabel('epoch')
+# plt.legend(['recon', 'disc', 'gen', 'disent', 'cov', 'clf', 'subset'], loc='upper left')
+# plt.savefig('/user/sina.garazhian/u12203/lustere-grete-mine/DISCOWER/models/losses_Sush_6_wdecay_weight_warmup_clf_mean_cov_subset_v5_valid.png')
+# plt.close()
+
+
+# plt.plot(recon_losses_test)
+# plt.plot(disc_losses_test)
+# plt.plot(gen_losses_test)
+# plt.plot(clf_losses_test)
+# plt.plot(all_losses_test)
+# plt.title('model losses test')
+# plt.ylabel('loss')
+# plt.xlabel('epoch')
+# plt.legend(['recon', 'disc', 'gen', 'clf', 'all'], loc='upper left')
+# plt.savefig('losses_test_Sush_4_wdecay_weight_warmup_clf.png')
+
+# plt.plot(i[0].item() for i in layers_losses)
+# plt.plot(i[1].item() for i in layers_losses)
+# plt.plot(i[2].item() for i in layers_losses)
+# # plt.plot(all_losses)
+# plt.title('layers losses')
+# plt.ylabel('loss')
+# plt.xlabel('epoch')
+# plt.legend(['layer1', 'layer2', 'layer3'], loc='upper left')
+# plt.savefig('layer_losses_spectral_3.png')
+# with open("results_subset.txt",'w') as file:
+#     for i in range(len(recon_losses)):
+#         file.write(f"recons loss is {recon_losses[i]}, disc loss is {disc_losses[i]}, gen loss is {gen_losses[i]}, disent loss is{disent_losses[i]}, cov loss is{cov_losses[i]}, clf loss is{clf_losses[i]}" + '\n')
+
+torch.save(encod, "/user/sina.garazhian/u12203/lustere-grete-mine/DISCOWER/models/encod_spread_v1.pt")
+torch.save(decod, '/user/sina.garazhian/u12203/lustere-grete-mine/DISCOWER/models/decod_spread_v1.pt')
+torch.save(subset_model, '/user/sina.garazhian/u12203/lustere-grete-mine/DISCOWER/models/subset_spread_v1.pt')
